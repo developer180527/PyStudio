@@ -1,4 +1,4 @@
-name: Build & Release PyStudio v1.0.0
+name: Build & Release PyStudio
 
 on:
   push:
@@ -30,7 +30,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Setup Rust
@@ -65,30 +65,21 @@ jobs:
           path: src-tauri/target/release/bundle/deb/*.deb
           if-no-files-found: warn
 
-  build-macos:
-    strategy:
-      matrix:
-        include:
-          - runner: macos-latest
-            target: aarch64-apple-darwin
-            arch: arm64
-          - runner: macos-13
-            target: x86_64-apple-darwin
-            arch: x64
-    runs-on: ${{ matrix.runner }}
+  build-macos-arm64:
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -104,13 +95,52 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tauriScript: npx tauri
-          args: --target ${{ matrix.target }}
+          args: --target aarch64-apple-darwin
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
-          name: PyStudio-macos-dmg-${{ matrix.arch }}
-          path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          name: PyStudio-macos-dmg-arm64
+          path: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  build-macos-x64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tauriScript: npx tauri
+          args: --target x86_64-apple-darwin
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: PyStudio-macos-dmg-x64
+          path: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
   build-windows:
@@ -121,7 +151,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Setup Rust
@@ -157,7 +187,7 @@ jobs:
           if-no-files-found: warn
 
   release:
-    needs: [build-linux, build-macos, build-windows]
+    needs: [build-linux, build-macos-arm64, build-macos-x64, build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
