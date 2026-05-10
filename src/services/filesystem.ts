@@ -223,6 +223,28 @@ export async function searchFiles(
   });
 }
 
+// ── LSP server ──
+
+export async function lspStart(projectPath: string): Promise<string> {
+  return invoke<string>("lsp_start", { projectPath });
+}
+
+export async function lspSend(message: string): Promise<void> {
+  return invoke("lsp_send", { message });
+}
+
+export async function lspStop(): Promise<void> {
+  return invoke("lsp_stop");
+}
+
+export async function onLspMessage(
+  callback: (message: string) => void,
+): Promise<UnlistenFn> {
+  return listen<string>("lsp-message", (event) => {
+    callback(event.payload);
+  });
+}
+
 // ── Git clone ──
 
 export async function gitClone(

@@ -54,6 +54,7 @@ import {
   type FsEntry,
   type SessionState,
 } from "./services/filesystem";
+import { lspClient, uriToPath, type LspDiagnostic } from "./services/lsp";
 import {
   Play,
   RotateCcw,
@@ -128,6 +129,13 @@ export default function App() {
   const [pythonPid, setPythonPid] = useState<number | null>(null);
   const [pythonInfo, setPythonInfo] = useState<string>("");
   const [isFileSearchOpen, setIsFileSearchOpen] = useState(false);
+
+  // ── LSP state ──
+  const [lspStatus, setLspStatus] = useState<string>("");
+  const [diagnosticsMap, setDiagnosticsMap] = useState<
+    Map<string, LspDiagnostic[]>
+  >(new Map());
+  const lspChangeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Git state (uses legacy ProjectItem for now) ──
   const gitItems = useRef<any[]>([]);
@@ -305,6 +313,40 @@ export default function App() {
         ...prev,
         { text: `Opened project: ${path}`, type: "system" },
       ]);
+
+      // Start LSP server
+      try {
+        if (lspClient.isStarted) await lspClient.stop();
+        const serverName = await lspClient.start(path);
+        setLspStatus(serverName);
+        setConsoleLines((prev) => [
+          ...prev,
+          { text: `LSP: ${serverName} connected.`, type: "system" },
+        ]);
+        // Notify LSP about restored session files
+        if (session?.open_files) {
+          for (const fp of session.open_files) {
+            if (fp.endsWith(".py")) {
+              try {
+                const c = await readFileContent(fp);
+                lspClient.didOpen(fp, c);
+              } catch {
+                // file may not exist
+              }
+            }
+          }
+        }
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        setLspStatus("");
+        setConsoleLines((prev) => [
+          ...prev,
+          {
+            text: `LSP: ${msg}`,
+            type: "error",
+          },
+        ]);
+      }
     },
     [refreshFileTree],
   );
@@ -329,6 +371,10 @@ export default function App() {
         try {
           const content = await readFileContent(path);
           setFileContents((prev) => new Map(prev).set(path, content));
+          // Notify LSP about newly opened Python file
+          if (path.endsWith(".py") && lspClient.isStarted) {
+            lspClient.didOpen(path, content);
+          }
         } catch (err: any) {
           setConsoleLines((prev) => [
             ...prev,
@@ -348,6 +394,15 @@ export default function App() {
       if (newCode === undefined || !activeFilePath) return;
       setFileContents((prev) => new Map(prev).set(activeFilePath, newCode));
       setDirtyFiles((prev) => new Set(prev).add(activeFilePath));
+
+      // Notify LSP of content change (debounced 150ms)
+      if (activeFilePath.endsWith(".py") && lspClient.isStarted) {
+        if (lspChangeTimer.current) clearTimeout(lspChangeTimer.current);
+        const fp = activeFilePath;
+        lspChangeTimer.current = setTimeout(() => {
+          lspClient.didChange(fp, newCode);
+        }, 150);
+      }
 
       // Autosave logic
       const prefs = (() => {
@@ -426,6 +481,10 @@ export default function App() {
         next.delete(activeFilePath);
         return next;
       });
+      // Notify LSP about save
+      if (activeFilePath.endsWith(".py") && lspClient.isStarted) {
+        lspClient.didSave(activeFilePath);
+      }
       setConsoleLines((prev) => [
         ...prev,
         {
@@ -606,6 +665,10 @@ export default function App() {
   const handleCloseTab = useCallback(
     (path: string, e: React.MouseEvent) => {
       e.stopPropagation();
+      // Notify LSP the document is closed
+      if (path.endsWith(".py") && lspClient.isStarted) {
+        lspClient.didClose(path);
+      }
       const newOpen = openFilePaths.filter((p) => p !== path);
       setOpenFilePaths(newOpen);
       if (activeFilePath === path) {
@@ -953,10 +1016,63 @@ export default function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
+  // ── LSP diagnostics callback ──
+
+  useEffect(() => {
+    lspClient.onDiagnostics = (uri: string, diags: LspDiagnostic[]) => {
+      const filePath = uriToPath(uri);
+      setDiagnosticsMap((prev) => {
+        const next = new Map(prev);
+        next.set(filePath, diags);
+        return next;
+      });
+    };
+    return () => {
+      lspClient.onDiagnostics = null;
+    };
+  }, []);
+
+  // ── LSP: keep active file in sync ──
+
+  useEffect(() => {
+    lspClient.activeFilePath =
+      activeFilePath && activeFilePath !== "__settings__"
+        ? activeFilePath
+        : null;
+  }, [activeFilePath]);
+
+  // ── LSP: cross-file go-to-definition ──
+
+  useEffect(() => {
+    const handleGoto = (e: Event) => {
+      const { path, line, column } = (e as CustomEvent).detail;
+      handleSelectFile(path).then(() => {
+        // Give Monaco time to mount the new file content, then reveal
+        setTimeout(() => {
+          window.dispatchEvent(
+            new CustomEvent("editor:revealLine", {
+              detail: { line, column },
+            }),
+          );
+        }, 150);
+      });
+    };
+    window.addEventListener("lsp:goto", handleGoto);
+    return () => window.removeEventListener("lsp:goto", handleGoto);
+  }, [handleSelectFile]);
+
   // ── Close project (go back to welcome) ──
 
   const handleCloseProject = useCallback(async () => {
-    // Save dirty files prompt could go here
+    // Stop LSP
+    if (lspClient.isStarted) {
+      try {
+        await lspClient.stop();
+      } catch {}
+    }
+    setLspStatus("");
+    setDiagnosticsMap(new Map());
+
     if (unlistenFsRef.current) unlistenFsRef.current();
     try {
       await unwatchDirectory();
@@ -1423,6 +1539,11 @@ export default function App() {
                           });
                         }}
                         executionLine={executionLine}
+                        diagnostics={
+                          activeFilePath
+                            ? diagnosticsMap.get(activeFilePath)
+                            : undefined
+                        }
                       />
                     ) : (
                       <div className="h-full flex flex-col items-center justify-center text-[var(--theme-text-muted)] bg-[var(--theme-surface)]">
@@ -1457,6 +1578,15 @@ export default function App() {
                         className={`px-3 flex items-center transition-colors h-full border-t-[3px] ${bottomPaneTab === "error-list" ? "bg-[var(--theme-panel)] text-[var(--theme-text-accent)] border-t-[var(--theme-text-accent)]" : "hover:bg-[var(--theme-surface)] hover:text-[var(--theme-text-main)] border-t-transparent"}`}
                       >
                         Error List
+                        {(() => {
+                          let count = 0;
+                          for (const [, d] of diagnosticsMap) count += d.length;
+                          return count > 0 ? (
+                            <span className="ml-1 px-1 min-w-[16px] text-center bg-[var(--theme-danger)] text-white text-[9px] rounded-full leading-tight">
+                              {count}
+                            </span>
+                          ) : null;
+                        })()}
                       </button>
                       <button
                         onClick={() => setBottomPaneTab("output")}
@@ -1491,9 +1621,75 @@ export default function App() {
                         showHeader={false}
                       />
                     ) : bottomPaneTab === "error-list" ? (
-                      <div className="p-4 text-xs text-[var(--theme-text-muted)] selectable-text">
-                        No errors found.
-                      </div>
+                      (() => {
+                        const allErrors: {
+                          sev: number;
+                          msg: string;
+                          file: string;
+                          line: number;
+                          path: string;
+                        }[] = [];
+                        for (const [fp, diags] of diagnosticsMap) {
+                          for (const d of diags) {
+                            allErrors.push({
+                              sev: d.severity,
+                              msg: d.message,
+                              file: fp.split("/").pop() || fp,
+                              line: d.range.start.line + 1,
+                              path: fp,
+                            });
+                          }
+                        }
+                        return allErrors.length === 0 ? (
+                          <div className="p-4 text-xs text-[var(--theme-text-muted)] selectable-text">
+                            No errors found.
+                          </div>
+                        ) : (
+                          <div className="overflow-auto h-full selectable-text">
+                            <table className="w-full text-xs">
+                              <thead className="sticky top-0">
+                                <tr className="border-b border-[var(--theme-border)] bg-[var(--theme-surface-alt)]">
+                                  <th className="px-2 py-1 text-left w-6"></th>
+                                  <th className="px-2 py-1 text-left">Description</th>
+                                  <th className="px-2 py-1 text-left w-32">File</th>
+                                  <th className="px-2 py-1 text-left w-12">Line</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {allErrors.map((err, i) => (
+                                  <tr
+                                    key={i}
+                                    onClick={() => {
+                                      handleSelectFile(err.path);
+                                      setTimeout(() => {
+                                        window.dispatchEvent(
+                                          new CustomEvent("editor:revealLine", {
+                                            detail: { line: err.line, column: 1 },
+                                          }),
+                                        );
+                                      }, 100);
+                                    }}
+                                    className="border-b border-[var(--theme-border)] hover:bg-[var(--theme-hover)] cursor-pointer text-[var(--theme-text-secondary)]"
+                                  >
+                                    <td className="px-2 py-1 text-center">
+                                      {err.sev === 1 ? (
+                                        <span className="text-[var(--theme-danger)]" title="Error">&#x2716;</span>
+                                      ) : err.sev === 2 ? (
+                                        <span className="text-yellow-500" title="Warning">&#x26A0;</span>
+                                      ) : (
+                                        <span className="text-blue-400" title="Info">&#x2139;</span>
+                                      )}
+                                    </td>
+                                    <td className="px-2 py-1 truncate max-w-0">{err.msg}</td>
+                                    <td className="px-2 py-1 text-[var(--theme-text-muted)]">{err.file}</td>
+                                    <td className="px-2 py-1 text-[var(--theme-text-muted)]">{err.line}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        );
+                      })()
                     ) : (
                       <SimulatedTerminal projectPath={projectPath} />
                     )}
@@ -1659,6 +1855,11 @@ export default function App() {
           {dirtyFiles.size > 0 && (
             <span className="px-1 text-yellow-300">
               {dirtyFiles.size} unsaved
+            </span>
+          )}
+          {lspStatus && (
+            <span className="px-1 hover:bg-white/20 rounded cursor-pointer transition-colors">
+              LSP: {lspStatus}
             </span>
           )}
           {pythonInfo && (

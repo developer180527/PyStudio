@@ -5,7 +5,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read as IoRead, Write as IoWrite};
+use std::io::{BufRead, Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -51,6 +51,11 @@ struct PtyState {
 struct PtySession {
     writer: Box<dyn IoWrite + Send>,
     _child: Box<dyn portable_pty::Child + Send>,
+}
+
+struct LspState {
+    process: Option<std::process::Child>,
+    stdin: Option<std::process::ChildStdin>,
 }
 
 // ── Helpers ──
@@ -594,6 +599,157 @@ fn search_files(project_path: String, query: String, max_results: usize) -> Vec<
     results
 }
 
+// ── LSP server ──
+
+fn find_lsp_server() -> Option<(String, Vec<String>)> {
+    let exists = |cmd: &str| -> bool {
+        #[cfg(unix)]
+        {
+            std::process::Command::new("which")
+                .arg(cmd)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("where")
+                .arg(cmd)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+    };
+
+    // Prefer pyright (fastest), then pylsp, then jedi
+    if exists("pyright-langserver") {
+        return Some(("pyright-langserver".into(), vec!["--stdio".into()]));
+    }
+    if exists("pylsp") {
+        return Some(("pylsp".into(), vec![]));
+    }
+    if exists("jedi-language-server") {
+        return Some(("jedi-language-server".into(), vec![]));
+    }
+    None
+}
+
+#[tauri::command]
+fn lsp_start(project_path: String, app: AppHandle) -> Result<String, String> {
+    let lsp_state = app.state::<Mutex<LspState>>();
+    let mut state = lsp_state.lock().map_err(|e| e.to_string())?;
+
+    // Kill existing LSP if running
+    if let Some(mut p) = state.process.take() {
+        let _ = p.kill();
+    }
+    state.stdin = None;
+
+    let (cmd, args) = find_lsp_server().ok_or_else(|| {
+        "No Python LSP server found. Install one with: pip install pyright".to_string()
+    })?;
+
+    let mut child = std::process::Command::new(&cmd)
+        .args(&args)
+        .current_dir(&project_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start LSP ({}): {}", cmd, e))?;
+
+    let stdout = child.stdout.take().ok_or("Failed to capture LSP stdout")?;
+    let stdin = child.stdin.take().ok_or("Failed to capture LSP stdin")?;
+
+    // Drain stderr to prevent pipe blocking
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut r = stderr;
+            loop {
+                match r.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+    }
+
+    state.process = Some(child);
+    state.stdin = Some(stdin);
+
+    let server_name = cmd.clone();
+
+    // Reader thread: parse Content-Length framed JSON-RPC messages from stdout
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        loop {
+            let mut content_length: usize = 0;
+            // Read headers until empty line
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => return, // EOF — server exited
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            break;
+                        }
+                        if let Some(len) = trimmed.strip_prefix("Content-Length: ") {
+                            content_length = len.parse().unwrap_or(0);
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+            if content_length == 0 {
+                continue;
+            }
+            // Read exactly content_length bytes of JSON body
+            let mut body = vec![0u8; content_length];
+            if reader.read_exact(&mut body).is_err() {
+                return;
+            }
+            let msg = String::from_utf8_lossy(&body).to_string();
+            let _ = app_handle.emit("lsp-message", &msg);
+        }
+    });
+
+    Ok(server_name)
+}
+
+#[tauri::command]
+fn lsp_send(message: String, app: AppHandle) -> Result<(), String> {
+    let lsp_state = app.state::<Mutex<LspState>>();
+    let mut state = lsp_state.lock().map_err(|e| e.to_string())?;
+    if let Some(ref mut stdin) = state.stdin {
+        let header = format!("Content-Length: {}\r\n\r\n", message.len());
+        stdin
+            .write_all(header.as_bytes())
+            .and_then(|_| stdin.write_all(message.as_bytes()))
+            .and_then(|_| stdin.flush())
+            .map_err(|e| format!("LSP write failed: {}", e))
+    } else {
+        Err("LSP server not running".into())
+    }
+}
+
+#[tauri::command]
+fn lsp_stop(app: AppHandle) -> Result<(), String> {
+    let lsp_state = app.state::<Mutex<LspState>>();
+    let mut state = lsp_state.lock().map_err(|e| e.to_string())?;
+    state.stdin = None;
+    if let Some(mut p) = state.process.take() {
+        let _ = p.kill();
+    }
+    Ok(())
+}
+
 // ── App entry ──
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -605,6 +761,10 @@ pub fn run() {
         .manage(Mutex::new(WatcherState { _watcher: None }))
         .manage(Mutex::new(PtyState {
             sessions: HashMap::new(),
+        }))
+        .manage(Mutex::new(LspState {
+            process: None,
+            stdin: None,
         }))
         .invoke_handler(tauri::generate_handler![
             // Filesystem
@@ -637,6 +797,10 @@ pub fn run() {
             pty_kill,
             // Search
             search_files,
+            // LSP
+            lsp_start,
+            lsp_send,
+            lsp_stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
