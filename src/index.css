@@ -1,0 +1,73 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap");
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  body {
+    background-color: var(--theme-surface);
+    color: var(--theme-text-main);
+    @apply antialiased overflow-hidden;
+  }
+  
+  /* Make inputs, textareas, and code/terminal content naturally selectable */
+  input, textarea, .selectable-text, .monaco-editor {
+    @apply select-text;
+  }
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 14px;
+  height: 14px;
+}
+::-webkit-scrollbar-track {
+  background-color: var(--theme-surface);
+  border-left: 1px solid var(--theme-border-alt);
+}
+::-webkit-scrollbar-thumb {
+  background-color: var(--theme-scrollbar-thumb);
+  border: 2px solid var(--theme-surface);
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--theme-scrollbar-hover);
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.hide-scrollbar {
+  -ms-overflow-style: none; /* IE and Edge */
+  scrollbar-width: none; /* Firefox */
+}
+
+/* Monaco style overrides if needed */
+.monaco-editor {
+  padding-top: 8px;
+}
+
+.editor-breakpoint {
+  background: var(--theme-danger);
+  border-radius: 50%;
+  width: 10px !important;
+  height: 10px !important;
+  left: 6px !important;
+  top: 5px !important;
+  cursor: pointer;
+}
+
+.editor-execution-line {
+  background-color: var(--theme-execution-line, rgba(255, 200, 0, 0.18));
+}
+
+.editor-execution-glyph {
+  background-color: var(--theme-execution-glyph, #f5c518);
+  clip-path: polygon(0 0, 100% 50%, 0 100%);
+  width: 10px !important;
+  height: 12px !important;
+  left: 6px !important;
+  top: 4px !important;
+}

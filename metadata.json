@@ -1,0 +1,6 @@
+{
+  "name": "PyStudio",
+  "description": "A high-performance Python IDE in your browser. Features Pyodide-powered execution, Monaco editor, and Gemini AI code assistance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["GEMINI_AI"]
+}
