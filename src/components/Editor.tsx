@@ -429,6 +429,14 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   const handleEditorDidMount: OnMount = (editor, monacoInstance) => {
     editorRef.current = editor;
 
+    // Force layout recalculation — Tauri's WebView sometimes reports
+    // wrong container dimensions on first paint
+    requestAnimationFrame(() => {
+      editor.layout();
+      // Second pass after fonts load and WebView settles
+      setTimeout(() => editor.layout(), 300);
+    });
+
     // Listen for clicks on the glyph margin to toggle breakpoints
     editor.onMouseDown((e) => {
       if (
@@ -486,7 +494,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           padding: { top: 16 },
           cursorBlinking: "smooth",
           cursorSmoothCaretAnimation: "on",
-          lineHeight: Math.round(prefs.fontSize * 1.55),
+          lineHeight: Math.round(prefs.fontSize * 1.6),
           renderLineHighlight: "all",
           tabSize: prefs.tabSize,
           insertSpaces: true,
@@ -494,6 +502,12 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           glyphMargin: true,
           quickSuggestions: true,
           suggestOnTriggerCharacters: true,
+          // ── Tauri WebView rendering fixes ──
+          fontLigatures: false,
+          fixedOverflowWidgets: true,
+          smoothScrolling: false,
+          // Disable GPU hints that break WKWebView/WebView2 canvas compositing
+          disableLayerHinting: true,
         }}
       />
     </div>
