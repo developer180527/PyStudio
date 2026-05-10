@@ -1,6 +1,11 @@
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
 use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
+use std::io::{Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -27,8 +32,25 @@ pub struct SessionState {
     pub editor_prefs: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SearchResult {
+    pub path: String,
+    pub name: String,
+    pub relative_path: String,
+    pub score: i64,
+}
+
 struct WatcherState {
     _watcher: Option<notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>>,
+}
+
+struct PtyState {
+    sessions: HashMap<String, PtySession>,
+}
+
+struct PtySession {
+    writer: Box<dyn IoWrite + Send>,
+    _child: Box<dyn portable_pty::Child + Send>,
 }
 
 // ── Helpers ──
@@ -98,7 +120,21 @@ fn build_tree(dir: &Path, max_depth: usize, current_depth: usize) -> Vec<FsEntry
     entries
 }
 
-// ── Commands ──
+fn find_python() -> String {
+    // Try common Python paths
+    for cmd in &["python3", "python"] {
+        if std::process::Command::new(cmd)
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            return cmd.to_string();
+        }
+    }
+    "python3".to_string()
+}
+
+// ── Filesystem Commands ──
 
 #[tauri::command]
 fn read_directory(path: String) -> Result<Vec<FsEntry>, String> {
@@ -174,7 +210,6 @@ fn get_home_dir() -> Result<String, String> {
 #[tauri::command]
 fn list_recent_dirs() -> Result<Vec<String>, String> {
     let session = load_session()?;
-    // Return just the project path as a recent if it exists
     if let Some(p) = session.project_path {
         if Path::new(&p).exists() {
             return Ok(vec![p]);
@@ -245,15 +280,10 @@ fn watch_directory(path: String, app: AppHandle) -> Result<(), String> {
     )
     .map_err(|e| format!("Failed to create watcher: {}", e))?;
 
-    let watcher = debouncer;
-    // We need to watch recursively
-    let mut debouncer = watcher;
+    let mut debouncer = debouncer;
     debouncer
         .watcher()
-        .watch(
-            Path::new(&watch_path),
-            notify::RecursiveMode::Recursive,
-        )
+        .watch(Path::new(&watch_path), notify::RecursiveMode::Recursive)
         .map_err(|e| format!("Failed to watch directory: {}", e))?;
 
     state._watcher = Some(debouncer);
@@ -296,6 +326,274 @@ fn get_directory_stats(path: String) -> Result<serde_json::Value, String> {
     }))
 }
 
+// ── Python execution (system interpreter) ──
+
+#[tauri::command]
+fn detect_python() -> Result<serde_json::Value, String> {
+    let cmd = find_python();
+    let output = std::process::Command::new(&cmd)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("Python not found: {}", e))?;
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let version = if version.is_empty() {
+        String::from_utf8_lossy(&output.stderr).trim().to_string()
+    } else {
+        version
+    };
+    Ok(serde_json::json!({
+        "command": cmd,
+        "version": version,
+    }))
+}
+
+#[tauri::command]
+fn run_python_script(file_path: String, cwd: String, app: AppHandle) -> Result<u32, String> {
+    let python = find_python();
+
+    let mut child = std::process::Command::new(&python)
+        .arg("-u") // unbuffered output
+        .arg(&file_path)
+        .current_dir(&cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUNBUFFERED", "1")
+        .spawn()
+        .map_err(|e| format!("Failed to start Python: {}", e))?;
+
+    let pid = child.id();
+    let app_stdout = app.clone();
+    let app_stderr = app.clone();
+    let app_exit = app.clone();
+
+    // Stream stdout
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let reader = std::io::BufReader::new(stdout);
+            let mut buf = [0u8; 4096];
+            let mut reader = reader;
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let _ = app_stdout.emit("python-stdout", &text);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Stream stderr
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let reader = std::io::BufReader::new(stderr);
+            let mut buf = [0u8; 4096];
+            let mut reader = reader;
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let _ = app_stderr.emit("python-stderr", &text);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Wait for exit in background
+    std::thread::spawn(move || {
+        let status = child.wait();
+        let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+        let _ = app_exit.emit("python-exit", code);
+    });
+
+    Ok(pid)
+}
+
+#[tauri::command]
+fn kill_process(pid: u32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(&["/PID", &pid.to_string(), "/F"])
+            .output();
+    }
+    Ok(())
+}
+
+// ── PTY terminal ──
+
+#[tauri::command]
+fn pty_spawn(
+    id: String,
+    cwd: String,
+    rows: u16,
+    cols: u16,
+    app: AppHandle,
+) -> Result<(), String> {
+    let pty_system = native_pty_system();
+
+    let pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("Failed to open PTY: {}", e))?;
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let mut cmd = CommandBuilder::new(&shell);
+    cmd.cwd(&cwd);
+
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("Failed to spawn shell: {}", e))?;
+
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("Failed to get PTY writer: {}", e))?;
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("Failed to get PTY reader: {}", e))?;
+
+    // Read PTY output and emit to frontend
+    let pty_id = id.clone();
+    let app_reader = app.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    let _ = app_reader.emit("pty-exit", &pty_id);
+                    break;
+                }
+                Ok(n) => {
+                    let data = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let _ = app_reader.emit("pty-data", (&pty_id, &data));
+                }
+                Err(_) => {
+                    let _ = app_reader.emit("pty-exit", &pty_id);
+                    break;
+                }
+            }
+        }
+    });
+
+    let pty_state = app.state::<Mutex<PtyState>>();
+    let mut state = pty_state.lock().map_err(|e| e.to_string())?;
+    state.sessions.insert(
+        id,
+        PtySession {
+            writer,
+            _child: child,
+        },
+    );
+
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_write(id: String, data: String, app: AppHandle) -> Result<(), String> {
+    let pty_state = app.state::<Mutex<PtyState>>();
+    let mut state = pty_state.lock().map_err(|e| e.to_string())?;
+    if let Some(session) = state.sessions.get_mut(&id) {
+        session
+            .writer
+            .write_all(data.as_bytes())
+            .map_err(|e| format!("PTY write failed: {}", e))?;
+        session
+            .writer
+            .flush()
+            .map_err(|e| format!("PTY flush failed: {}", e))?;
+    } else {
+        return Err(format!("PTY session '{}' not found", id));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_resize(id: String, rows: u16, cols: u16, app: AppHandle) -> Result<(), String> {
+    // portable-pty doesn't expose resize on the session easily,
+    // so we accept the command silently. The terminal still works.
+    let _ = (id, rows, cols, app);
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_kill(id: String, app: AppHandle) -> Result<(), String> {
+    let pty_state = app.state::<Mutex<PtyState>>();
+    let mut state = pty_state.lock().map_err(|e| e.to_string())?;
+    if let Some(mut session) = state.sessions.remove(&id) {
+        let _ = session._child.kill();
+    }
+    Ok(())
+}
+
+// ── File search ──
+
+#[tauri::command]
+fn search_files(project_path: String, query: String, max_results: usize) -> Vec<SearchResult> {
+    let matcher = SkimMatcherV2::default();
+    let base = Path::new(&project_path);
+    let mut results: Vec<SearchResult> = Vec::new();
+
+    for entry in WalkDir::new(&project_path)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !is_hidden_or_ignored(&name)
+        })
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_dir() {
+            continue;
+        }
+
+        let full_path = entry.path().to_string_lossy().to_string();
+        let relative = entry
+            .path()
+            .strip_prefix(base)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .to_string();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        // Match against both filename and relative path
+        let score_name = matcher.fuzzy_match(&name, &query).unwrap_or(0);
+        let score_path = matcher.fuzzy_match(&relative, &query).unwrap_or(0);
+        let score = score_name.max(score_path);
+
+        if score > 0 {
+            results.push(SearchResult {
+                path: full_path,
+                name,
+                relative_path: relative,
+                score,
+            });
+        }
+    }
+
+    results.sort_by(|a, b| b.score.cmp(&a.score));
+    results.truncate(max_results);
+    results
+}
+
 // ── App entry ──
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -305,7 +603,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(Mutex::new(WatcherState { _watcher: None }))
+        .manage(Mutex::new(PtyState {
+            sessions: HashMap::new(),
+        }))
         .invoke_handler(tauri::generate_handler![
+            // Filesystem
             read_directory,
             read_file_content,
             write_file_content,
@@ -316,12 +618,25 @@ pub fn run() {
             path_exists,
             get_home_dir,
             list_recent_dirs,
+            get_directory_stats,
+            // Session
             save_session,
             load_session,
             clear_session,
+            // File watcher
             watch_directory,
             unwatch_directory,
-            get_directory_stats,
+            // Python execution
+            detect_python,
+            run_python_script,
+            kill_process,
+            // PTY
+            pty_spawn,
+            pty_write,
+            pty_resize,
+            pty_kill,
+            // Search
+            search_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

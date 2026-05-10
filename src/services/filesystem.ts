@@ -19,6 +19,13 @@ export interface SessionState {
   editor_prefs: Record<string, unknown> | null;
 }
 
+export interface SearchResult {
+  path: string;
+  name: string;
+  relative_path: string;
+  score: number;
+}
+
 // ── Filesystem commands ──
 
 export async function readDirectory(path: string): Promise<FsEntry[]> {
@@ -115,6 +122,107 @@ export async function onFsChanged(
   });
 }
 
+// ── Python execution (system interpreter) ──
+
+export async function detectPython(): Promise<{
+  command: string;
+  version: string;
+}> {
+  return invoke("detect_python");
+}
+
+export async function runPythonScript(
+  filePath: string,
+  cwd: string,
+): Promise<number> {
+  return invoke<number>("run_python_script", { filePath, cwd });
+}
+
+export async function killProcess(pid: number): Promise<void> {
+  return invoke("kill_process", { pid });
+}
+
+export async function onPythonStdout(
+  callback: (data: string) => void,
+): Promise<UnlistenFn> {
+  return listen<string>("python-stdout", (event) => {
+    callback(event.payload);
+  });
+}
+
+export async function onPythonStderr(
+  callback: (data: string) => void,
+): Promise<UnlistenFn> {
+  return listen<string>("python-stderr", (event) => {
+    callback(event.payload);
+  });
+}
+
+export async function onPythonExit(
+  callback: (code: number) => void,
+): Promise<UnlistenFn> {
+  return listen<number>("python-exit", (event) => {
+    callback(event.payload);
+  });
+}
+
+// ── PTY terminal ──
+
+export async function ptySpawn(
+  id: string,
+  cwd: string,
+  rows: number,
+  cols: number,
+): Promise<void> {
+  return invoke("pty_spawn", { id, cwd, rows, cols });
+}
+
+export async function ptyWrite(id: string, data: string): Promise<void> {
+  return invoke("pty_write", { id, data });
+}
+
+export async function ptyResize(
+  id: string,
+  rows: number,
+  cols: number,
+): Promise<void> {
+  return invoke("pty_resize", { id, rows, cols });
+}
+
+export async function ptyKill(id: string): Promise<void> {
+  return invoke("pty_kill", { id });
+}
+
+export async function onPtyData(
+  callback: (id: string, data: string) => void,
+): Promise<UnlistenFn> {
+  return listen<[string, string]>("pty-data", (event) => {
+    callback(event.payload[0], event.payload[1]);
+  });
+}
+
+export async function onPtyExit(
+  callback: (id: string) => void,
+): Promise<UnlistenFn> {
+  return listen<string>("pty-exit", (event) => {
+    callback(event.payload);
+  });
+}
+
+// ── File search ──
+
+export async function searchFiles(
+  projectPath: string,
+  query: string,
+  maxResults: number = 20,
+): Promise<SearchResult[]> {
+  return invoke<SearchResult[]>("search_files", {
+    projectPath,
+    query,
+    maxResults,
+  });
+}
+
 // ── Git clone ──
 
 export async function gitClone(
@@ -123,7 +231,12 @@ export async function gitClone(
   onProgress?: (line: string) => void,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const cmd = Command.create("git", ["clone", "--progress", repoUrl, targetDir]);
+    const cmd = Command.create("git", [
+      "clone",
+      "--progress",
+      repoUrl,
+      targetDir,
+    ]);
 
     cmd.on("error", (err) => {
       reject(new Error(`Git clone failed: ${err}`));

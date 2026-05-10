@@ -9,6 +9,7 @@ import { Console } from "./components/Console";
 import { SimulatedTerminal } from "./components/Terminal";
 import { AIChat } from "./components/AIChat";
 import { FileExplorer } from "./components/FileExplorer";
+import { FileSearch } from "./components/FileSearch";
 import { WelcomeScreen } from "./components/WelcomeScreen";
 import { Settings } from "./components/Settings";
 import {
@@ -44,6 +45,12 @@ import {
   unwatchDirectory,
   onFsChanged,
   openFolderDialog,
+  detectPython,
+  runPythonScript,
+  killProcess,
+  onPythonStdout,
+  onPythonStderr,
+  onPythonExit,
   type FsEntry,
   type SessionState,
 } from "./services/filesystem";
@@ -65,6 +72,7 @@ import {
   Package,
   GitBranch,
   Replace,
+  Square,
 } from "lucide-react";
 
 interface ConsoleLine {
@@ -116,6 +124,11 @@ export default function App() {
     InstalledPackage[]
   >([]);
 
+  // ── Python execution state ──
+  const [pythonPid, setPythonPid] = useState<number | null>(null);
+  const [pythonInfo, setPythonInfo] = useState<string>("");
+  const [isFileSearchOpen, setIsFileSearchOpen] = useState(false);
+
   // ── Git state (uses legacy ProjectItem for now) ──
   const gitItems = useRef<any[]>([]);
   const gitState = useGit(gitItems.current);
@@ -123,6 +136,8 @@ export default function App() {
   // ── Refs ──
   const unlistenFsRef = useRef<(() => void) | null>(null);
   const sessionSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pythonListeners = useRef<(() => void)[]>([]);
 
   // ── Helpers ──
 
@@ -196,23 +211,20 @@ export default function App() {
     };
   }, []);
 
-  // ── Initialize Pyodide ──
+  // ── Detect system Python ──
 
   useEffect(() => {
     const init = async () => {
-      const isOffline = !navigator.onLine;
       setConsoleLines([
-        {
-          text: `Connecting to Python environment (Pyodide)... ${isOffline ? "[Offline Mode]" : ""}`,
-          type: "system",
-        },
+        { text: "Detecting system Python interpreter...", type: "system" },
       ]);
       try {
-        await getPyodide();
+        const info = await detectPython();
+        setPythonInfo(`${info.command} (${info.version})`);
         setConsoleLines((prev) => [
           ...prev,
           {
-            text: "Environment Ready. Python 3.11/3.12 available browser-side.",
+            text: `Environment Ready. ${info.version} via system interpreter.`,
             type: "system",
           },
         ]);
@@ -220,7 +232,7 @@ export default function App() {
         setConsoleLines((prev) => [
           ...prev,
           {
-            text: "Failed to initialize Python. Check your internet connection.",
+            text: "Python not found on system. Install Python 3 to run scripts.",
             type: "error",
           },
         ]);
@@ -229,6 +241,9 @@ export default function App() {
       }
     };
     init();
+
+    // Also initialize Pyodide in background for debugger
+    getPyodide().catch(() => {});
   }, []);
 
   // ── Project management ──
@@ -333,9 +348,72 @@ export default function App() {
       if (newCode === undefined || !activeFilePath) return;
       setFileContents((prev) => new Map(prev).set(activeFilePath, newCode));
       setDirtyFiles((prev) => new Set(prev).add(activeFilePath));
+
+      // Autosave logic
+      const prefs = (() => {
+        try {
+          const raw = localStorage.getItem("pystudio_editor_prefs");
+          return raw ? JSON.parse(raw) : {};
+        } catch {
+          return {};
+        }
+      })();
+
+      if (prefs.autoSave === "afterDelay") {
+        if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current);
+        autoSaveTimer.current = setTimeout(async () => {
+          try {
+            await writeFileContent(activeFilePath, newCode);
+            setDirtyFiles((prev) => {
+              const next = new Set(prev);
+              next.delete(activeFilePath);
+              return next;
+            });
+          } catch {}
+        }, 1000);
+      }
     },
     [activeFilePath],
   );
+
+  // Autosave on focus change
+  useEffect(() => {
+    const handleVisibility = async () => {
+      const prefs = (() => {
+        try {
+          const raw = localStorage.getItem("pystudio_editor_prefs");
+          return raw ? JSON.parse(raw) : {};
+        } catch {
+          return {};
+        }
+      })();
+
+      if (
+        (prefs.autoSave === "onFocusChange" ||
+          prefs.autoSave === "onWindowChange") &&
+        document.hidden
+      ) {
+        // Save all dirty files
+        const dirty: string[] = Array.from(dirtyFiles);
+        for (const fp of dirty) {
+          const content = fileContents.get(fp);
+          if (content !== undefined) {
+            try {
+              await writeFileContent(fp, content);
+            } catch {}
+          }
+        }
+        if (dirty.length > 0) setDirtyFiles(new Set());
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("blur", handleVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("blur", handleVisibility);
+    };
+  }, [dirtyFiles, fileContents]);
 
   const handleSave = useCallback(async () => {
     if (!activeFilePath) return;
@@ -549,41 +627,81 @@ export default function App() {
   // ── Run / Debug ──
 
   const handleRun = useCallback(async () => {
-    if (isRunning || isInitializing || !activeFilePath) return;
-    // Save before running
-    if (dirtyFiles.has(activeFilePath)) {
-      const content = fileContents.get(activeFilePath);
+    if (isRunning || isInitializing || !activeFilePath || !projectPath) return;
+
+    // Save all dirty files before running (so imports work)
+    const dirty: string[] = Array.from(dirtyFiles);
+    for (const fp of dirty) {
+      const content = fileContents.get(fp);
       if (content !== undefined) {
         try {
-          await writeFileContent(activeFilePath, content);
-          setDirtyFiles((prev) => {
-            const next = new Set(prev);
-            next.delete(activeFilePath);
-            return next;
-          });
+          await writeFileContent(fp, content);
         } catch {}
       }
     }
+    setDirtyFiles(new Set());
 
     setIsRunning(true);
+    setBottomPaneTab("output");
     setConsoleLines((prev) => [
       ...prev,
       {
-        text: `> Running ${activeFilePath.split("/").pop()}...`,
+        text: `> Running ${activeFilePath.split("/").pop()} (system Python, cwd: ${projectPath})...`,
         type: "system",
       },
     ]);
 
-    await runPython(
-      activeFileContent,
-      (out) =>
-        setConsoleLines((prev) => [...prev, { text: out, type: "output" }]),
-      (err) =>
-        setConsoleLines((prev) => [...prev, { text: err, type: "error" }]),
-    );
+    // Clean up previous listeners
+    pythonListeners.current.forEach((fn) => fn());
+    pythonListeners.current = [];
 
-    setIsRunning(false);
-  }, [activeFilePath, activeFileContent, isRunning, isInitializing, dirtyFiles, fileContents]);
+    try {
+      const u1 = await onPythonStdout((data) => {
+        setConsoleLines((prev) => [...prev, { text: data, type: "output" }]);
+      });
+      const u2 = await onPythonStderr((data) => {
+        setConsoleLines((prev) => [...prev, { text: data, type: "error" }]);
+      });
+      const u3 = await onPythonExit((code) => {
+        setConsoleLines((prev) => [
+          ...prev,
+          {
+            text: `> Process exited with code ${code}.`,
+            type: code === 0 ? "system" : "error",
+          },
+        ]);
+        setIsRunning(false);
+        setPythonPid(null);
+      });
+      pythonListeners.current = [u1, u2, u3];
+
+      const pid = await runPythonScript(activeFilePath, projectPath);
+      setPythonPid(pid);
+    } catch (err: any) {
+      setConsoleLines((prev) => [
+        ...prev,
+        {
+          text: `> Failed to run: ${err?.message || err}`,
+          type: "error",
+        },
+      ]);
+      setIsRunning(false);
+    }
+  }, [activeFilePath, projectPath, isRunning, isInitializing, dirtyFiles, fileContents]);
+
+  const handleStop = useCallback(async () => {
+    if (pythonPid) {
+      try {
+        await killProcess(pythonPid);
+        setConsoleLines((prev) => [
+          ...prev,
+          { text: "> Process terminated.", type: "system" },
+        ]);
+      } catch {}
+      setPythonPid(null);
+      setIsRunning(false);
+    }
+  }, [pythonPid]);
 
   // ── Packages ──
 
@@ -821,6 +939,20 @@ export default function App() {
 
   const clearConsole = () => setConsoleLines([]);
 
+  // ── Keyboard shortcuts ──
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Ctrl+P / Cmd+P: File search
+      if ((e.ctrlKey || e.metaKey) && e.key === "p") {
+        e.preventDefault();
+        setIsFileSearchOpen(true);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
   // ── Close project (go back to welcome) ──
 
   const handleCloseProject = useCallback(async () => {
@@ -959,6 +1091,11 @@ export default function App() {
       title: "Tools",
       items: [
         {
+          label: "Go to File...",
+          shortcut: "Ctrl+P",
+          action: "go_to_file",
+        },
+        {
           label: "Command Palette...",
           shortcut: "Ctrl+Shift+P",
           action: "command_palette",
@@ -1025,6 +1162,9 @@ export default function App() {
         case "view_output":
           setBottomPaneTab("output");
           break;
+        case "go_to_file":
+          setIsFileSearchOpen(true);
+          break;
         case "run":
           handleRun();
           break;
@@ -1084,12 +1224,12 @@ export default function App() {
         <MenuBar menus={menuData} onAction={handleMenuAction} />
         <div className="flex-1" />
         <div
-          onClick={() => handleMenuAction("find")}
+          onClick={() => setIsFileSearchOpen(true)}
           className="flex items-center h-5 bg-[var(--theme-panel)] border border-[var(--theme-border)] rounded-sm px-1.5 text-[11px] w-56 mx-2 overflow-hidden shadow-inner cursor-pointer hover:bg-[var(--theme-hover)] transition-colors"
-          title="Find (Ctrl+F)"
+          title="Go to File (Ctrl+P)"
         >
           <Search size={12} className="text-[var(--theme-text-muted)] mr-1.5" />
-          <span className="text-[var(--theme-text-muted)]">Search</span>
+          <span className="text-[var(--theme-text-muted)]">Go to File...</span>
         </div>
       </div>
 
@@ -1145,21 +1285,24 @@ export default function App() {
               ▼
             </span>
           </div>
-          <button
-            onClick={handleRun}
-            disabled={isRunning || isInitializing || !activeFilePath || isSettingsOpen}
-            className="flex items-center justify-center p-1 px-2 h-full hover:bg-[var(--theme-hover)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            title="Start Without Debugging"
-          >
-            {isRunning ? (
-              <RotateCcw
-                size={12}
-                className="animate-spin text-[var(--theme-text-accent)]"
-              />
-            ) : (
+          {isRunning ? (
+            <button
+              onClick={handleStop}
+              className="flex items-center justify-center p-1 px-2 h-full hover:bg-[var(--theme-hover)] transition-colors text-[var(--theme-danger)]"
+              title="Stop Execution"
+            >
+              <Square size={12} className="fill-current" />
+            </button>
+          ) : (
+            <button
+              onClick={handleRun}
+              disabled={isInitializing || !activeFilePath || isSettingsOpen}
+              className="flex items-center justify-center p-1 px-2 h-full hover:bg-[var(--theme-hover)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Run with System Python"
+            >
               <Play size={12} className="text-[var(--theme-text-main)]" />
-            )}
-          </button>
+            </button>
+          )}
         </div>
         <div className="flex-1" />
 
@@ -1483,9 +1626,9 @@ export default function App() {
           <div className="flex items-center gap-1.5 h-full">
             <span className="opacity-90">
               {isInitializing
-                ? "Connecting to Python Background Service..."
+                ? "Detecting Python..."
                 : isRunning
-                  ? "Build started..."
+                  ? "Running..."
                   : "Ready"}
             </span>
           </div>
@@ -1518,6 +1661,11 @@ export default function App() {
               {dirtyFiles.size} unsaved
             </span>
           )}
+          {pythonInfo && (
+            <span className="px-1 hover:bg-white/20 rounded cursor-pointer transition-colors">
+              {pythonInfo}
+            </span>
+          )}
         </div>
       </div>
 
@@ -1526,6 +1674,14 @@ export default function App() {
         currentCode={activeFileContent}
         isOpen={isAIOpen}
         onClose={() => setIsAIOpen(false)}
+      />
+
+      {/* File Search Modal (Ctrl+P) */}
+      <FileSearch
+        isOpen={isFileSearchOpen}
+        projectPath={projectPath}
+        onClose={() => setIsFileSearchOpen(false)}
+        onSelect={handleSelectFile}
       />
     </div>
   );
