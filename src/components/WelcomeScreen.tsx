@@ -326,7 +326,7 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
       {/* Footer */}
       <div className="h-6 flex items-center px-4 bg-[var(--theme-status)] text-[var(--theme-text-status)] text-[11px] shrink-0">
         <span className="opacity-80">
-          v0.1.0
+          v1.0.0
         </span>
       </div>
     </div>

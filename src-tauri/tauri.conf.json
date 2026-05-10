@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "PyStudio",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "identifier": "com.venugopal.pystudio",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -33,6 +33,19 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "category": "DeveloperTool",
+    "shortDescription": "Python IDE powered by Pyodide",
+    "longDescription": "PyStudio is a lightweight Python IDE built with Tauri, featuring real Python execution, LSP integration, split editor, and an AI assistant.",
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "both"
+      }
+    }
   }
 }
