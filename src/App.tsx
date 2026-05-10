@@ -56,6 +56,13 @@ import {
 } from "./services/filesystem";
 import { lspClient, uriToPath, type LspDiagnostic } from "./services/lsp";
 import {
+  loadKeybindings,
+  matchesKeybinding,
+  getBinding,
+  type KeyBinding,
+} from "./services/keybindings";
+import { addRecentProject } from "./services/filesystem";
+import {
   Play,
   RotateCcw,
   FolderOpen,
@@ -74,6 +81,7 @@ import {
   GitBranch,
   Replace,
   Square,
+  Columns2,
 } from "lucide-react";
 
 interface ConsoleLine {
@@ -136,6 +144,16 @@ export default function App() {
     Map<string, LspDiagnostic[]>
   >(new Map());
   const lspChangeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ── Split editor state ──
+  const [splitFilePath, setSplitFilePath] = useState<string | null>(null);
+  const [activePaneIndex, setActivePaneIndex] = useState<0 | 1>(0);
+
+  // ── Keybindings ──
+  const [keybindings, setKeybindings] = useState<KeyBinding[]>(loadKeybindings);
+
+  // ── Tab drag state ──
+  const dragTabRef = useRef<number | null>(null);
 
   // ── Git state (uses legacy ProjectItem for now) ──
   const gitItems = useRef<any[]>([]);
@@ -259,6 +277,8 @@ export default function App() {
   const openProject = useCallback(
     async (path: string, session?: SessionState) => {
       setProjectPath(path);
+      // Track in recent projects
+      addRecentProject(path).catch(() => {});
 
       // Load file tree
       const tree = await readDirectory(path);
@@ -1002,18 +1022,99 @@ export default function App() {
 
   const clearConsole = () => setConsoleLines([]);
 
-  // ── Keyboard shortcuts ──
+  // ── Split editor helpers ──
+
+  const handleToggleSplit = useCallback(() => {
+    if (splitFilePath) {
+      // Close split
+      setSplitFilePath(null);
+      setActivePaneIndex(0);
+    } else if (activeFilePath && activeFilePath !== "__settings__") {
+      // Open split with the same file (user can pick another)
+      setSplitFilePath(activeFilePath);
+      setActivePaneIndex(1);
+    }
+  }, [activeFilePath, splitFilePath]);
+
+  const splitFileContent =
+    splitFilePath ? fileContents.get(splitFilePath) ?? "" : "";
+
+  // ── Tab reorder handler ──
+
+  const handleTabDrop = useCallback(
+    (dragIdx: number, dropIdx: number) => {
+      if (dragIdx === dropIdx) return;
+      setOpenFilePaths((prev) => {
+        const next = [...prev];
+        const [moved] = next.splice(dragIdx, 1);
+        next.splice(dropIdx, 0, moved);
+        return next;
+      });
+    },
+    [],
+  );
+
+  // ── Keyboard shortcuts (keybinding-aware) ──
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Ctrl+P / Cmd+P: File search
-      if ((e.ctrlKey || e.metaKey) && e.key === "p") {
+      const kb = keybindings;
+      const match = (id: string) =>
+        matchesKeybinding(e, getBinding(kb, id));
+
+      if (match("go_to_file")) {
         e.preventDefault();
         setIsFileSearchOpen(true);
+      } else if (match("save")) {
+        e.preventDefault();
+        handleSave();
+      } else if (match("save_all")) {
+        e.preventDefault();
+        handleSaveAll();
+      } else if (match("toggle_terminal")) {
+        e.preventDefault();
+        setBottomPaneTab((prev) =>
+          prev === "terminal" ? "output" : "terminal",
+        );
+      } else if (match("close_tab")) {
+        e.preventDefault();
+        if (activeFilePath) {
+          const newOpen = openFilePaths.filter((p) => p !== activeFilePath);
+          if (activeFilePath.endsWith(".py") && lspClient.isStarted) {
+            lspClient.didClose(activeFilePath);
+          }
+          setOpenFilePaths(newOpen);
+          setActiveFilePath(
+            newOpen.length > 0 ? newOpen[newOpen.length - 1] : null,
+          );
+        }
+      } else if (match("settings")) {
+        e.preventDefault();
+        handleOpenSettings();
+      } else if (match("split_editor")) {
+        e.preventDefault();
+        handleToggleSplit();
+      } else if (match("debug")) {
+        e.preventDefault();
+        handleStartDebug();
+      } else if (match("step_over")) {
+        e.preventDefault();
+        handleStepOver();
+      } else if (match("step_into")) {
+        e.preventDefault();
+        handleStepInto();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [keybindings, activeFilePath, openFilePaths, handleSave, handleSaveAll, handleToggleSplit, handleStartDebug, handleStepOver, handleStepInto]);
+
+  // ── Reload keybindings when changed in settings ──
+
+  useEffect(() => {
+    const handler = () => setKeybindings(loadKeybindings());
+    window.addEventListener("keybindings:changed", handler);
+    return () => window.removeEventListener("keybindings:changed", handler);
   }, []);
 
   // ── LSP diagnostics callback ──
@@ -1084,6 +1185,8 @@ export default function App() {
     setFileContents(new Map());
     setDirtyFiles(new Set());
     setExpandedPaths(new Set());
+    setSplitFilePath(null);
+    setActivePaneIndex(0);
   }, []);
 
   // ── Menu ──
@@ -1228,7 +1331,7 @@ export default function App() {
       items: [
         { label: "Close All Tabs", action: "close_all_tabs" },
         { divider: true },
-        { label: "Split Display", action: "split_display" },
+        { label: "Split Editor", shortcut: "Ctrl+\\", action: "split_editor" },
       ],
     },
     {
@@ -1280,6 +1383,9 @@ export default function App() {
           break;
         case "go_to_file":
           setIsFileSearchOpen(true);
+          break;
+        case "split_editor":
+          handleToggleSplit();
           break;
         case "run":
           handleRun();
@@ -1424,6 +1530,13 @@ export default function App() {
 
         <div className="flex items-center gap-0.5 border-r border-[var(--theme-border)] pr-1.5 mr-1.5">
           <button
+            onClick={handleToggleSplit}
+            className={`p-1 hover:bg-[var(--theme-hover)] rounded ${splitFilePath ? "text-[var(--theme-text-accent)]" : "text-[var(--theme-text-secondary)]"}`}
+            title={splitFilePath ? "Close Split Editor" : "Split Editor (Ctrl+\\)"}
+          >
+            <Columns2 size={16} />
+          </button>
+          <button
             onClick={() => handleMenuAction("find")}
             className="p-1 hover:bg-[var(--theme-hover)] rounded text-[var(--theme-text-secondary)]"
             title="Find (Ctrl+F)"
@@ -1473,7 +1586,7 @@ export default function App() {
                   {/* Tab Bar */}
                   {openFilePaths.length > 0 && (
                     <div className="flex bg-[var(--theme-surface-alt)] overflow-x-auto select-none shrink-0 border-b border-[var(--theme-border)] hide-scrollbar shadow-sm pt-1 px-1 gap-0.5">
-                      {openFilePaths.map((path) => {
+                      {openFilePaths.map((path, tabIdx) => {
                         const name =
                           path === "__settings__"
                             ? "Settings"
@@ -1483,6 +1596,24 @@ export default function App() {
                         return (
                           <div
                             key={path}
+                            draggable
+                            onDragStart={() => {
+                              dragTabRef.current = tabIdx;
+                            }}
+                            onDragOver={(e) => {
+                              e.preventDefault();
+                              e.dataTransfer.dropEffect = "move";
+                            }}
+                            onDrop={(e) => {
+                              e.preventDefault();
+                              if (dragTabRef.current !== null) {
+                                handleTabDrop(dragTabRef.current, tabIdx);
+                                dragTabRef.current = null;
+                              }
+                            }}
+                            onDragEnd={() => {
+                              dragTabRef.current = null;
+                            }}
                             onClick={() => {
                               if (path === "__settings__") {
                                 setActiveFilePath("__settings__");
@@ -1515,36 +1646,156 @@ export default function App() {
                     {isSettingsOpen ? (
                       <Settings />
                     ) : activeFilePath ? (
-                      <CodeEditor
-                        code={activeFileContent}
-                        onChange={handleCodeChange}
-                        onRun={handleRun}
-                        onSave={handleSave}
-                        breakpoints={breakpoints
-                          .filter(
-                            (b) => b.fileId === activeFilePath && b.enabled,
-                          )
-                          .map((b) => b.line)}
-                        onBreakpointsChange={(bps) => {
-                          setBreakpoints((prev) => {
-                            const otherFilesBps = prev.filter(
-                              (b) => b.fileId !== activeFilePath,
-                            );
-                            const newBps = bps.map((line) => ({
-                              fileId: activeFilePath,
-                              line,
-                              enabled: true,
-                            }));
-                            return [...otherFilesBps, ...newBps];
-                          });
-                        }}
-                        executionLine={executionLine}
-                        diagnostics={
-                          activeFilePath
-                            ? diagnosticsMap.get(activeFilePath)
-                            : undefined
-                        }
-                      />
+                      splitFilePath ? (
+                        /* ── Split Editor (two panes side-by-side) ── */
+                        <PanelGroup orientation="horizontal" className="h-full">
+                          {/* Left pane */}
+                          <Panel defaultSize={50} minSize={20}>
+                            <div
+                              className={`h-full flex flex-col ${activePaneIndex === 0 ? "ring-1 ring-[var(--theme-text-accent)] ring-inset" : ""}`}
+                              onClick={() => setActivePaneIndex(0)}
+                            >
+                              <div className="h-6 flex items-center px-2 bg-[var(--theme-surface-alt)] border-b border-[var(--theme-border)] text-[11px] text-[var(--theme-text-secondary)] shrink-0">
+                                <span className="truncate">{activeFilePath.split("/").pop()}</span>
+                              </div>
+                              <div className="flex-1 overflow-hidden">
+                                <CodeEditor
+                                  code={activeFileContent}
+                                  onChange={(val) => {
+                                    if (activePaneIndex === 0) handleCodeChange(val);
+                                  }}
+                                  onRun={handleRun}
+                                  onSave={handleSave}
+                                  breakpoints={breakpoints
+                                    .filter(
+                                      (b) => b.fileId === activeFilePath && b.enabled,
+                                    )
+                                    .map((b) => b.line)}
+                                  onBreakpointsChange={(bps) => {
+                                    setBreakpoints((prev) => {
+                                      const otherFilesBps = prev.filter(
+                                        (b) => b.fileId !== activeFilePath,
+                                      );
+                                      const newBps = bps.map((line) => ({
+                                        fileId: activeFilePath,
+                                        line,
+                                        enabled: true,
+                                      }));
+                                      return [...otherFilesBps, ...newBps];
+                                    });
+                                  }}
+                                  executionLine={executionLine}
+                                  diagnostics={diagnosticsMap.get(activeFilePath)}
+                                />
+                              </div>
+                            </div>
+                          </Panel>
+
+                          <PanelResizeHandle className="w-1 bg-[var(--theme-surface-alt)] hover:bg-[var(--theme-text-accent)] transition-colors cursor-col-resize" />
+
+                          {/* Right pane */}
+                          <Panel defaultSize={50} minSize={20}>
+                            <div
+                              className={`h-full flex flex-col ${activePaneIndex === 1 ? "ring-1 ring-[var(--theme-text-accent)] ring-inset" : ""}`}
+                              onClick={() => setActivePaneIndex(1)}
+                            >
+                              <div className="h-6 flex items-center px-2 bg-[var(--theme-surface-alt)] border-b border-[var(--theme-border)] text-[11px] text-[var(--theme-text-secondary)] shrink-0 justify-between">
+                                <span className="truncate">{splitFilePath.split("/").pop()}</span>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setSplitFilePath(null);
+                                    setActivePaneIndex(0);
+                                  }}
+                                  className="p-0.5 hover:bg-[var(--theme-hover)] rounded"
+                                  title="Close Split"
+                                >
+                                  <X size={10} />
+                                </button>
+                              </div>
+                              <div className="flex-1 overflow-hidden">
+                                <CodeEditor
+                                  code={splitFileContent}
+                                  onChange={(val) => {
+                                    if (val !== undefined && splitFilePath) {
+                                      setFileContents((prev) =>
+                                        new Map(prev).set(splitFilePath, val),
+                                      );
+                                      setDirtyFiles((prev) =>
+                                        new Set(prev).add(splitFilePath),
+                                      );
+                                      if (splitFilePath.endsWith(".py") && lspClient.isStarted) {
+                                        if (lspChangeTimer.current) clearTimeout(lspChangeTimer.current);
+                                        lspChangeTimer.current = setTimeout(() => {
+                                          lspClient.didChange(splitFilePath, val);
+                                        }, 150);
+                                      }
+                                    }
+                                  }}
+                                  onRun={handleRun}
+                                  onSave={handleSave}
+                                  breakpoints={breakpoints
+                                    .filter(
+                                      (b) => b.fileId === splitFilePath && b.enabled,
+                                    )
+                                    .map((b) => b.line)}
+                                  onBreakpointsChange={(bps) => {
+                                    setBreakpoints((prev) => {
+                                      const otherFilesBps = prev.filter(
+                                        (b) => b.fileId !== splitFilePath,
+                                      );
+                                      const newBps = bps.map((line) => ({
+                                        fileId: splitFilePath!,
+                                        line,
+                                        enabled: true,
+                                      }));
+                                      return [...otherFilesBps, ...newBps];
+                                    });
+                                  }}
+                                  executionLine={undefined}
+                                  diagnostics={
+                                    splitFilePath
+                                      ? diagnosticsMap.get(splitFilePath)
+                                      : undefined
+                                  }
+                                />
+                              </div>
+                            </div>
+                          </Panel>
+                        </PanelGroup>
+                      ) : (
+                        /* ── Single editor pane ── */
+                        <CodeEditor
+                          code={activeFileContent}
+                          onChange={handleCodeChange}
+                          onRun={handleRun}
+                          onSave={handleSave}
+                          breakpoints={breakpoints
+                            .filter(
+                              (b) => b.fileId === activeFilePath && b.enabled,
+                            )
+                            .map((b) => b.line)}
+                          onBreakpointsChange={(bps) => {
+                            setBreakpoints((prev) => {
+                              const otherFilesBps = prev.filter(
+                                (b) => b.fileId !== activeFilePath,
+                              );
+                              const newBps = bps.map((line) => ({
+                                fileId: activeFilePath,
+                                line,
+                                enabled: true,
+                              }));
+                              return [...otherFilesBps, ...newBps];
+                            });
+                          }}
+                          executionLine={executionLine}
+                          diagnostics={
+                            activeFilePath
+                              ? diagnosticsMap.get(activeFilePath)
+                              : undefined
+                          }
+                        />
+                      )
                     ) : (
                       <div className="h-full flex flex-col items-center justify-center text-[var(--theme-text-muted)] bg-[var(--theme-surface)]">
                         <Layout

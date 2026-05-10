@@ -90,6 +90,16 @@ export async function openFolderDialog(): Promise<string | null> {
   return null;
 }
 
+// ── Recent projects ──
+
+export async function getRecentProjects(): Promise<string[]> {
+  return invoke<string[]>("get_recent_projects");
+}
+
+export async function addRecentProject(path: string): Promise<void> {
+  return invoke("add_recent_project", { path });
+}
+
 // ── Session ──
 
 export async function saveSession(state: SessionState): Promise<void> {

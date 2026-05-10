@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { useTheme } from "../theme";
 import {
   getGeminiApiKey,
@@ -6,6 +6,12 @@ import {
   getGeminiModel,
   setGeminiModel,
 } from "../services/gemini";
+import {
+  loadKeybindings,
+  updateKeybinding,
+  resetKeybindings,
+  type KeyBinding,
+} from "../services/keybindings";
 
 interface EditorPrefs {
   fontSize: number;
@@ -41,6 +47,86 @@ function savePrefs(p: EditorPrefs) {
   }
 }
 
+// ── Keybinding capture component ──
+
+const KeyCapture: React.FC<{
+  binding: KeyBinding;
+  onCapture: (id: string, key: string) => void;
+}> = ({ binding, onCapture }) => {
+  const [capturing, setCapturing] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (capturing && inputRef.current) {
+      inputRef.current.focus();
+    }
+  }, [capturing]);
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    // Ignore lone modifier keys
+    if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) return;
+
+    const parts: string[] = [];
+    if (e.ctrlKey || e.metaKey) parts.push("Ctrl");
+    if (e.shiftKey) parts.push("Shift");
+    if (e.altKey) parts.push("Alt");
+
+    let key = e.key;
+    if (key === " ") key = "Space";
+    else if (key.length === 1) key = key.toUpperCase();
+    else if (key === "Escape") {
+      setCapturing(false);
+      return;
+    }
+    parts.push(key);
+
+    const combo = parts.join("+");
+    onCapture(binding.id, combo);
+    setCapturing(false);
+  };
+
+  const isCustom = binding.key !== binding.defaultKey;
+
+  return (
+    <tr className="border-b border-[var(--theme-border)] hover:bg-[var(--theme-hover)] transition-colors">
+      <td className="px-3 py-2 text-sm">{binding.label}</td>
+      <td className="px-3 py-2">
+        {capturing ? (
+          <input
+            ref={inputRef}
+            type="text"
+            readOnly
+            onKeyDown={handleKeyDown}
+            onBlur={() => setCapturing(false)}
+            placeholder="Press keys..."
+            className="w-full px-2 py-1 text-xs bg-[var(--theme-active)] border-2 border-[var(--theme-text-accent)] rounded outline-none text-[var(--theme-text-main)] animate-pulse"
+          />
+        ) : (
+          <button
+            onClick={() => setCapturing(true)}
+            className={`px-2 py-1 text-xs font-mono rounded border transition-colors ${
+              isCustom
+                ? "bg-[var(--theme-active)] border-[var(--theme-text-accent)] text-[var(--theme-text-accent)]"
+                : "bg-[var(--theme-surface-alt)] border-[var(--theme-border)] text-[var(--theme-text-secondary)]"
+            } hover:bg-[var(--theme-hover)] cursor-pointer`}
+            title="Click to change shortcut"
+          >
+            {binding.key}
+          </button>
+        )}
+      </td>
+      <td className="px-3 py-2 text-xs text-[var(--theme-text-muted)]">
+        {isCustom ? `Default: ${binding.defaultKey}` : ""}
+      </td>
+    </tr>
+  );
+};
+
+// ── Settings component ──
+
 export const Settings: React.FC = () => {
   const { theme, setTheme } = useTheme();
   const [prefs, setPrefs] = useState<EditorPrefs>(loadPrefs);
@@ -48,6 +134,7 @@ export const Settings: React.FC = () => {
   const [showKey, setShowKey] = useState(false);
   const [model, setModelState] = useState(getGeminiModel);
   const [savedFlash, setSavedFlash] = useState<string | null>(null);
+  const [keybindings, setKeybindings] = useState<KeyBinding[]>(loadKeybindings);
 
   useEffect(() => {
     savePrefs(prefs);
@@ -66,6 +153,19 @@ export const Settings: React.FC = () => {
     setGeminiModel(model.trim());
     setSavedFlash("Saved");
     setTimeout(() => setSavedFlash(null), 1500);
+  };
+
+  const handleKeybindingChange = (id: string, newKey: string) => {
+    const updated = updateKeybinding(id, newKey);
+    setKeybindings(updated);
+    // Notify the app that keybindings changed
+    window.dispatchEvent(new CustomEvent("keybindings:changed"));
+  };
+
+  const handleResetKeybindings = () => {
+    const defaults = resetKeybindings();
+    setKeybindings(defaults);
+    window.dispatchEvent(new CustomEvent("keybindings:changed"));
   };
 
   return (
@@ -192,6 +292,51 @@ export const Settings: React.FC = () => {
                 <option value="onWindowChange">On Window Change</option>
               </select>
             </div>
+          </div>
+        </section>
+
+        {/* Keybinding customization */}
+        <section className="mb-10">
+          <div className="flex items-center justify-between mb-4 border-b border-[var(--theme-border)] pb-2">
+            <h2 className="text-xl font-medium text-[var(--theme-text-accent)]">
+              Keyboard Shortcuts
+            </h2>
+            <button
+              onClick={handleResetKeybindings}
+              className="px-3 py-1.5 border border-[var(--theme-border)] rounded bg-[var(--theme-surface-alt)] hover:bg-[var(--theme-hover)] text-xs font-medium transition-colors"
+            >
+              Reset All
+            </button>
+          </div>
+
+          <p className="text-xs text-[var(--theme-text-muted)] mb-3">
+            Click a shortcut to change it. Press Escape to cancel.
+          </p>
+
+          <div className="border border-[var(--theme-border)] rounded overflow-hidden">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="bg-[var(--theme-surface-alt)] border-b border-[var(--theme-border)]">
+                  <th className="px-3 py-2 text-left font-medium text-[var(--theme-text-secondary)]">
+                    Action
+                  </th>
+                  <th className="px-3 py-2 text-left font-medium text-[var(--theme-text-secondary)] w-40">
+                    Shortcut
+                  </th>
+                  <th className="px-3 py-2 text-left font-medium text-[var(--theme-text-muted)] w-36">
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {keybindings.map((kb) => (
+                  <KeyCapture
+                    key={kb.id}
+                    binding={kb}
+                    onCapture={handleKeybindingChange}
+                  />
+                ))}
+              </tbody>
+            </table>
           </div>
         </section>
 

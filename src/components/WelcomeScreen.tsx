@@ -6,13 +6,14 @@ import {
   Loader2,
   AlertCircle,
   Clock,
+  Trash2,
 } from "lucide-react";
 import {
   openFolderDialog,
-  loadSession,
   gitClone,
   getHomeDir,
   pathExists,
+  getRecentProjects,
 } from "../services/filesystem";
 
 interface WelcomeScreenProps {
@@ -28,23 +29,23 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
   const [cloneProgress, setCloneProgress] = useState<string[]>([]);
   const [isCloning, setIsCloning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [recentProject, setRecentProject] = useState<string | null>(null);
+  const [recentProjects, setRecentProjects] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
     (async () => {
       try {
-        const session = await loadSession();
-        if (session.project_path) {
-          const exists = await pathExists(session.project_path);
-          if (exists) {
-            setRecentProject(session.project_path);
-          }
+        const projects = await getRecentProjects();
+        // Filter to existing paths
+        const valid: string[] = [];
+        for (const p of projects) {
+          if (await pathExists(p)) valid.push(p);
         }
+        setRecentProjects(valid);
         const home = await getHomeDir();
         setCloneTarget(home + "/Developer");
       } catch {
-        // no saved session
+        // no saved data
       } finally {
         setIsLoading(false);
       }
@@ -65,6 +66,11 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
     if (path) {
       onOpenProject(path);
     }
+  };
+
+  const handleRemoveRecent = (path: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setRecentProjects((prev) => prev.filter((p) => p !== path));
   };
 
   const handleClone = async () => {
@@ -123,7 +129,7 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
         PyStudio
       </div>
 
-      <div className="flex-1 flex items-center justify-center">
+      <div className="flex-1 flex items-center justify-center overflow-y-auto py-8">
         <div className="w-full max-w-2xl px-8">
           {/* Logo / Title */}
           <div className="text-center mb-10">
@@ -137,24 +143,43 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
 
           {mode === "home" ? (
             <div className="space-y-3">
-              {/* Recent project */}
-              {recentProject && (
-                <button
-                  onClick={() => onOpenProject(recentProject)}
-                  className="w-full flex items-center gap-4 p-4 rounded-lg border border-[var(--theme-border)] bg-[var(--theme-surface)] hover:bg-[var(--theme-hover)] hover:border-[var(--theme-text-accent)] transition-all group text-left"
-                >
-                  <div className="p-2.5 rounded-lg bg-[var(--theme-active)] text-[var(--theme-text-accent)] group-hover:scale-105 transition-transform">
-                    <Clock size={22} />
+              {/* Recent projects */}
+              {recentProjects.length > 0 && (
+                <div className="mb-2">
+                  <div className="text-xs font-medium text-[var(--theme-text-muted)] uppercase tracking-wider mb-2 px-1">
+                    Recent Projects
                   </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="font-medium text-sm">
-                      Continue Last Project
-                    </div>
-                    <div className="text-xs text-[var(--theme-text-muted)] truncate mt-0.5">
-                      {recentProject}
-                    </div>
+                  <div className="space-y-1.5 max-h-[200px] overflow-y-auto">
+                    {recentProjects.map((proj) => (
+                      <button
+                        key={proj}
+                        onClick={() => onOpenProject(proj)}
+                        className="w-full flex items-center gap-3 px-4 py-2.5 rounded-lg border border-[var(--theme-border)] bg-[var(--theme-surface)] hover:bg-[var(--theme-hover)] hover:border-[var(--theme-text-accent)] transition-all group text-left"
+                      >
+                        <Clock
+                          size={16}
+                          className="text-[var(--theme-text-accent)] shrink-0"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div className="font-medium text-sm truncate">
+                            {proj.split("/").pop()}
+                          </div>
+                          <div className="text-[11px] text-[var(--theme-text-muted)] truncate">
+                            {proj}
+                          </div>
+                        </div>
+                        <button
+                          onClick={(e) => handleRemoveRecent(proj, e)}
+                          className="opacity-0 group-hover:opacity-100 p-1 hover:bg-[var(--theme-active)] rounded transition-all text-[var(--theme-text-muted)] hover:text-[var(--theme-danger)]"
+                          title="Remove from recent"
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </button>
+                    ))}
                   </div>
-                </button>
+                  <div className="border-b border-[var(--theme-border)] my-4" />
+                </div>
               )}
 
               {/* Open project */}

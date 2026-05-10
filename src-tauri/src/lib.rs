@@ -212,15 +212,54 @@ fn get_home_dir() -> Result<String, String> {
         .ok_or_else(|| "Could not determine home directory".to_string())
 }
 
+fn recent_projects_path() -> PathBuf {
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("com.venugopal.pystudio");
+    fs::create_dir_all(&data_dir).ok();
+    data_dir.join("recent_projects.json")
+}
+
+#[tauri::command]
+fn get_recent_projects() -> Result<Vec<String>, String> {
+    let path = recent_projects_path();
+    if !path.exists() {
+        // Fall back to legacy session
+        let session = load_session()?;
+        if let Some(p) = session.project_path {
+            if Path::new(&p).exists() {
+                return Ok(vec![p]);
+            }
+        }
+        return Ok(vec![]);
+    }
+    let data = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let projects: Vec<String> = serde_json::from_str(&data).unwrap_or_default();
+    // Filter to paths that still exist
+    Ok(projects.into_iter().filter(|p| Path::new(p).exists()).collect())
+}
+
+#[tauri::command]
+fn add_recent_project(path: String) -> Result<(), String> {
+    let file = recent_projects_path();
+    let mut projects: Vec<String> = if file.exists() {
+        let data = fs::read_to_string(&file).unwrap_or_default();
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        vec![]
+    };
+    // Remove if already present, then prepend
+    projects.retain(|p| p != &path);
+    projects.insert(0, path);
+    // Keep max 15 recent projects
+    projects.truncate(15);
+    let json = serde_json::to_string_pretty(&projects).map_err(|e| e.to_string())?;
+    fs::write(&file, json).map_err(|e| format!("Failed to save recent projects: {}", e))
+}
+
 #[tauri::command]
 fn list_recent_dirs() -> Result<Vec<String>, String> {
-    let session = load_session()?;
-    if let Some(p) = session.project_path {
-        if Path::new(&p).exists() {
-            return Ok(vec![p]);
-        }
-    }
-    Ok(vec![])
+    get_recent_projects()
 }
 
 // ── Session persistence ──
@@ -778,6 +817,8 @@ pub fn run() {
             path_exists,
             get_home_dir,
             list_recent_dirs,
+            get_recent_projects,
+            add_recent_project,
             get_directory_stats,
             // Session
             save_session,
