@@ -20,11 +20,42 @@ const DEFAULT_PREFS: EditorPrefs = {
   autoSave: "off",
 };
 
+function normalizePrefs(value: Partial<EditorPrefs> | null | undefined): EditorPrefs {
+  const lineNumbers = ["on", "off", "relative"].includes(
+    String(value?.lineNumbers),
+  )
+    ? value!.lineNumbers!
+    : DEFAULT_PREFS.lineNumbers;
+  const autoSave = [
+    "off",
+    "afterDelay",
+    "onFocusChange",
+    "onWindowChange",
+  ].includes(String(value?.autoSave))
+    ? value!.autoSave!
+    : DEFAULT_PREFS.autoSave;
+  const fontSize =
+    typeof value?.fontSize === "number" && Number.isFinite(value.fontSize)
+      ? Math.min(24, Math.max(10, value.fontSize))
+      : DEFAULT_PREFS.fontSize;
+  const tabSize =
+    typeof value?.tabSize === "number" && [2, 4, 6, 8].includes(value.tabSize)
+      ? value.tabSize
+      : DEFAULT_PREFS.tabSize;
+
+  return {
+    fontSize,
+    tabSize,
+    lineNumbers,
+    autoSave,
+  };
+}
+
 function loadPrefs(): EditorPrefs {
   try {
     const raw = localStorage.getItem(PREFS_STORAGE);
     if (!raw) return DEFAULT_PREFS;
-    return { ...DEFAULT_PREFS, ...JSON.parse(raw) };
+    return normalizePrefs(JSON.parse(raw));
   } catch {
     return DEFAULT_PREFS;
   }
@@ -269,7 +300,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent<EditorPrefs>).detail;
-      if (detail) setPrefs(detail);
+      if (detail) setPrefs(normalizePrefs(detail));
     };
     window.addEventListener("editor:prefs", handler);
     return () => window.removeEventListener("editor:prefs", handler);
@@ -426,16 +457,21 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     onSaveRef.current = onSave;
   }, [onSave]);
 
+  useEffect(() => {
+    if (!editorRef.current) return;
+    const frame = requestAnimationFrame(() => editorRef.current?.layout());
+    return () => cancelAnimationFrame(frame);
+  }, [prefs.fontSize, prefs.tabSize, prefs.lineNumbers]);
+
   const handleEditorDidMount: OnMount = (editor, monacoInstance) => {
     editorRef.current = editor;
 
-    // Force layout recalculation — Tauri's WebView sometimes reports
-    // wrong container dimensions on first paint
+    // Force layout recalculation after first paint and after web fonts settle.
     requestAnimationFrame(() => {
       editor.layout();
-      // Second pass after fonts load and WebView settles
       setTimeout(() => editor.layout(), 300);
     });
+    document.fonts?.ready.then(() => editor.layout()).catch(() => {});
 
     // Listen for clicks on the glyph margin to toggle breakpoints
     editor.onMouseDown((e) => {
@@ -499,14 +535,14 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           tabSize: prefs.tabSize,
           insertSpaces: true,
           lineNumbers: prefs.lineNumbers,
+          lineNumbersMinChars: 3,
+          lineDecorationsWidth: 12,
           glyphMargin: true,
           quickSuggestions: true,
           suggestOnTriggerCharacters: true,
-          // ── Tauri WebView rendering fixes ──
           fontLigatures: false,
           fixedOverflowWidgets: true,
           smoothScrolling: false,
-          // Disable GPU hints that break WKWebView/WebView2 canvas compositing
           disableLayerHinting: true,
         }}
       />

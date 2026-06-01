@@ -44,35 +44,17 @@
   scrollbar-width: none; /* Firefox */
 }
 
-/* ── Monaco rendering fixes for Tauri WebView ──
-   WKWebView and WebView2 mishandle Monaco's GPU-composited canvas layers,
-   causing overlapping lines, missing line numbers, and scroll glitches.
-   Force the compositor to treat editor layers as simple DOM elements. */
-.monaco-editor {
-  padding-top: 8px;
-  -webkit-transform: translateZ(0);
-  transform: translateZ(0);
-}
+/* Monaco should own its internal layer geometry. Avoid padding/transforms on
+   editor internals because they desync the text layer, cursor, and gutter in
+   Tauri's WebKit view. */
+.monaco-editor,
 .monaco-editor .overflow-guard {
-  -webkit-transform: translateZ(0) !important;
-  transform: translateZ(0) !important;
+  width: 100% !important;
+  height: 100% !important;
 }
-.monaco-editor .lines-content.monaco-editor-background {
-  will-change: unset !important;
-  -webkit-font-smoothing: antialiased;
-}
-.monaco-editor .view-lines > .view-line {
-  will-change: unset !important;
-}
-.monaco-editor .margin {
-  will-change: unset !important;
-}
+
 .monaco-editor .line-numbers {
-  will-change: unset !important;
-}
-/* Prevent sub-pixel rendering artifacts in glyph margin */
-.monaco-editor .margin-view-overlays > div {
-  will-change: unset !important;
+  color: var(--theme-text-muted) !important;
 }
 
 .editor-breakpoint {
